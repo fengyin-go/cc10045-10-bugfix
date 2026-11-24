@@ -129,9 +129,28 @@ DDL_STATEMENTS = [
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
     )""",
 
+    # 一次漏斗运算 = 一个不可变版本。重新计算只追加新版本，旧版本连同路径明细保留可回查。
+    """CREATE TABLE IF NOT EXISTS funnel_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        funnel_id INTEGER NOT NULL,
+        run_no INTEGER NOT NULL,
+        conversion_window_hours INTEGER NOT NULL,
+        steps_snapshot TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT '已完成',
+        entry_count INTEGER NOT NULL DEFAULT 0,
+        converted_count INTEGER NOT NULL DEFAULT 0,
+        converted_subjects INTEGER NOT NULL DEFAULT 0,
+        parameters TEXT NOT NULL DEFAULT '{}',
+        computed_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (funnel_id) REFERENCES funnels(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_frun_funnel ON funnel_runs(funnel_id, run_no)",
+
+    # 版本化的步骤指标，funnel_results 保留旧列结构以便历史查询兼容。
     """CREATE TABLE IF NOT EXISTS funnel_results (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         funnel_id INTEGER NOT NULL,
+        run_id INTEGER,
         step_index INTEGER NOT NULL,
         step_name TEXT NOT NULL,
         entry_count INTEGER NOT NULL,
@@ -142,6 +161,41 @@ DDL_STATEMENTS = [
         FOREIGN KEY (funnel_id) REFERENCES funnels(id)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_fr_funnel ON funnel_results(funnel_id)",
+    "CREATE INDEX IF NOT EXISTS idx_fr_run ON funnel_results(run_id, step_index)",
+
+    # 每条路径 = 一个主体一次被确认的转化机会。step 事件 id 指向 events，可逐条回查原始记录。
+    """CREATE TABLE IF NOT EXISTS funnel_paths (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        funnel_id INTEGER NOT NULL,
+        subject_key TEXT NOT NULL,
+        outcome TEXT NOT NULL DEFAULT '已转化',
+        reached_step INTEGER NOT NULL DEFAULT 0,
+        step_count INTEGER NOT NULL DEFAULT 0,
+        opportunity_event_id INTEGER,
+        opportunity_at TEXT,
+        attempt_event_id INTEGER,
+        attempt_at TEXT,
+        conversion_event_id INTEGER,
+        conversion_at TEXT,
+        window_seconds INTEGER NOT NULL DEFAULT 0,
+        failure_code TEXT,
+        failure_reason TEXT,
+        missing_step_index INTEGER,
+        missing_step_name TEXT,
+        opportunity_campaign TEXT,
+        opportunity_source TEXT,
+        candidate_opportunities TEXT NOT NULL DEFAULT '[]',
+        attribution_campaign TEXT,
+        attribution_source TEXT,
+        attribution_events TEXT NOT NULL DEFAULT '[]',
+        step_events TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (run_id) REFERENCES funnel_runs(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_fp_run ON funnel_paths(run_id, id)",
+    "CREATE INDEX IF NOT EXISTS idx_fp_run_subject ON funnel_paths(run_id, subject_key)",
+    "CREATE INDEX IF NOT EXISTS idx_fp_outcome ON funnel_paths(run_id, outcome)",
 
     # ==================== Retention Tier ====================
     """CREATE TABLE IF NOT EXISTS retention_tasks (

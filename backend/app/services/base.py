@@ -15,6 +15,11 @@ class BaseModuleService:
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
+    # 同一中文字段在不同模块可能落到不同列（如「分群条件」），按模块覆盖全局映射。
+    COLUMN_OVERRIDES: dict[str, str] = {}
+
+    def _column(self, chinese_field: str) -> str:
+        return self.COLUMN_OVERRIDES.get(chinese_field) or _to_column_name(chinese_field)
 
     def _module_table(self) -> str:
         """返回模块主表名，子类可覆盖。"""
@@ -57,12 +62,12 @@ class BaseModuleService:
 
         for field, expected in (filters or {}).items():
             if field in self.LIST_FIELDS:
-                col = _to_column_name(field)
+                col = self._column(field)
                 where.append(f"{col} LIKE ?")
                 params.append(f"%{expected}%")
 
         if keyword and self.LIST_FIELDS:
-            col = _to_column_name(self.LIST_FIELDS[0])
+            col = self._column(self.LIST_FIELDS[0])
             where.append(f"{col} LIKE ?")
             params.append(f"%{keyword}%")
 
@@ -76,7 +81,17 @@ class BaseModuleService:
             f"SELECT * FROM {table} WHERE {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?",
             params + [size, (page - 1) * size],
         )
+        for row in rows:
+            self._attach_display_fields(row)
         return rows, total
+
+    def _attach_display_fields(self, row: dict[str, Any]) -> None:
+        """按 LIST_FIELDS 的中文名暴露一份值，页面和导出不必知道物理列名。"""
+        for field in self.LIST_FIELDS:
+            column = self._column(field)
+            if column == "status":
+                continue
+            row.setdefault(field, row.get(column, ""))
 
     def get_entry(self, entry_id: int) -> dict[str, Any] | None:
         return db.fetchone(f"SELECT * FROM {self._module_table()} WHERE id=?", [entry_id])
@@ -92,10 +107,12 @@ class BaseModuleService:
         table = self._module_table()
         data: dict[str, Any] = {}
         for field in self.LIST_FIELDS:
-            col = _to_column_name(field)
+            col = self._column(field)
             data[col] = values.get(field, "")
         if "name" not in data and self.LIST_FIELDS:
-            data["name"] = values.get(self.LIST_FIELDS[0], "")
+            columns = {r["name"] for r in db.fetchall(f"PRAGMA table_info({table})")}
+            if "name" in columns:
+                data["name"] = values.get(self.LIST_FIELDS[0], "")
         data["status"] = self.STATUS_ORDER[0]
 
         entry_id = db.insert(table, data)

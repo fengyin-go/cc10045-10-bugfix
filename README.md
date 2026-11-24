@@ -73,6 +73,31 @@ npm run dev
 
 ## 约定
 
+### 漏斗口径与版本
+
+- 一次计算生成一个不可变版本 `funnel_runs`，路径明细写入 `funnel_paths`；重新计算只追加新版本，
+  旧版本路径原样保留，旧报告保存 `run_id` 即可回查当时已确认的链。
+- 每一次首步事件开启一个「转化机会」。一笔末步事件（如付款）只归给一次机会：在它之前、
+  窗口之内、且能按步骤顺序补齐整条链的最近一次机会；已归属的机会不再接收第二笔付款。
+- 先后顺序一律按 `occurred_at`（实际发生时间）判断；`ingested_at` 只记录入库时刻，
+  迟到补录的事件只进入重新计算后的新版本。
+- 同一用户多次浏览各带自己的活动归因，下钻里的 `candidate_opportunities` 逐条列出并标出本次采用哪一条。
+- 未转化路径会给出明确结论：`少了一步`（缺哪个步骤）或 `顺序对不上`（付款早于浏览、
+  步骤发生在付款之后），以及 `超出转化窗口`、`付款已归属另一次浏览机会`。
+
+相关接口（均在 `/api/pipeline` 下）：
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/funnels/{id}/compute?as_of=&lookback_hours=` | 生成新版本 |
+| GET | `/funnels/{id}/runs` | 列出全部版本 |
+| GET | `/funnels/{id}/results?run_id=` | 某版本步骤结果与流失原因 |
+| GET | `/funnels/{id}/paths?run_id=&outcome=&subject_key=` | 路径明细 |
+| GET | `/funnels/{id}/paths/{path_id}?run_id=` | 下钻，用 event_id 关联原始记录 |
+| GET | `/funnels/{id}/conversions?run_id=` | 转化明细与来源归因核对 |
+| GET | `/funnels/{id}/unconverted?run_id=` | 未转化解释（少一步 / 顺序不对） |
+| GET | `/funnels/{id}/subjects/{user}/timeline?run_id=` | 某人的原始事件时间线 |
+
 - 全部模块共享`frontend/src/views/WorkbenchView.vue|tsx`和一套资源路由。
 - 每个模块仍保留独立`backend/app/services/<模块>.py`；纯前端保留
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。

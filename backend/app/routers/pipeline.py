@@ -67,10 +67,97 @@ def api_compute_segment(segment_id: int) -> dict:
 
 
 @router.post("/funnels/{funnel_id}/compute")
-def api_compute_funnel(funnel_id: int) -> dict:
-    """对指定漏斗执行分析计算。"""
+def api_compute_funnel(
+    funnel_id: int,
+    as_of: str | None = None,
+    lookback_hours: float | None = None,
+) -> dict:
+    """对指定漏斗执行分析计算，生成新的不可变版本。"""
     svc = service_for("funnel_analyzer")
-    return svc.run_computation(funnel_id)
+    return svc.run_computation(funnel_id, as_of=as_of, lookback_hours=lookback_hours)
+
+
+@router.get("/funnels/{funnel_id}/runs")
+def api_funnel_runs(funnel_id: int) -> dict:
+    """列出漏斗的所有运算版本，旧版本保留可回查。"""
+    svc = service_for("funnel_analyzer")
+    runs = svc.list_runs(funnel_id)
+    return {"ok": True, "funnel_id": funnel_id, "items": runs, "total": len(runs)}
+
+
+@router.get("/funnels/{funnel_id}/results")
+def api_funnel_results(funnel_id: int, run_id: int | None = None) -> dict:
+    """读取某次运算的步骤明细；不传 run_id 取最新版本。"""
+    svc = service_for("funnel_analyzer")
+    run = svc.resolve_run(funnel_id, run_id)
+    if run is None:
+        return {"ok": False, "message": f"漏斗 {funnel_id} 没有可用的运算版本"}
+    return {
+        "ok": True,
+        "run": svc._public_run(run),
+        "steps_detail": svc.funnel_results(funnel_id, run["id"]),
+    }
+
+
+@router.get("/funnels/{funnel_id}/paths")
+def api_funnel_paths(
+    funnel_id: int,
+    run_id: int | None = None,
+    outcome: str | None = None,
+    subject_key: str | None = None,
+    step_index: int | None = None,
+    page: int = 1,
+    size: int = 50,
+) -> dict:
+    """按运算版本列出路径明细。"""
+    svc = service_for("funnel_analyzer")
+    return {"ok": True, **svc.list_paths(
+        funnel_id, run_id=run_id, outcome=outcome, subject_key=subject_key,
+        step_index=step_index, page=page, size=size,
+    )}
+
+
+@router.get("/funnels/{funnel_id}/paths/{path_id}")
+def api_funnel_path_detail(funnel_id: int, path_id: int, run_id: int | None = None) -> dict:
+    """下钻单条路径，关联 events 原始记录核对事件时刻。"""
+    svc = service_for("funnel_analyzer")
+    detail = svc.path_detail(funnel_id, path_id, run_id=run_id)
+    if detail is None:
+        return {"ok": False, "message": f"路径 {path_id} 不属于漏斗 {funnel_id}"}
+    return {"ok": True, **detail}
+
+
+@router.get("/funnels/{funnel_id}/conversions")
+def api_funnel_conversions(funnel_id: int, run_id: int | None = None) -> dict:
+    """转化明细：已转化路径及每条路径的浏览机会归因。"""
+    svc = service_for("funnel_analyzer")
+    return {"ok": True, **svc.conversion_detail(funnel_id, run_id=run_id)}
+
+
+@router.get("/funnels/{funnel_id}/unconverted")
+def api_funnel_unconverted(
+    funnel_id: int, run_id: int | None = None, subject_key: str | None = None,
+) -> dict:
+    """未转化明细：解释少了一步还是顺序对不上。"""
+    svc = service_for("funnel_analyzer")
+    return {"ok": True, **svc.unconverted_detail(
+        funnel_id, run_id=run_id, subject_key=subject_key)}
+
+
+@router.get("/funnels/{funnel_id}/subjects/{subject_key}/timeline")
+def api_funnel_subject_timeline(
+    funnel_id: int, subject_key: str, run_id: int | None = None,
+) -> dict:
+    """某主体的原始事件时间线与本次运算的归属结果。"""
+    svc = service_for("funnel_analyzer")
+    return {"ok": True, **svc.subject_timeline(funnel_id, subject_key, run_id=run_id)}
+
+
+@router.get("/funnels/{funnel_id}/drops")
+def api_funnel_drops(funnel_id: int, run_id: int | None = None) -> dict:
+    """某版本各步骤流失原因分析。"""
+    svc = service_for("funnel_analyzer")
+    return {"ok": True, **svc.drop_analysis(funnel_id, run_id=run_id)}
 
 
 @router.post("/retention/{task_id}/compute")

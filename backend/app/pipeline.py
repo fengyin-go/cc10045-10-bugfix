@@ -407,106 +407,772 @@ def compute_segment(segment: dict[str, Any]) -> int:
 # ============================================================================
 # 漏斗分析计算管道
 # ============================================================================
+#
+# 口径要点：
+#   1. 以「转化机会」为最小单位：首步的每一条行为事件开启一次机会。
+#   2. 一笔末步事件（付款）只归给一次机会：在它之前、窗口之内、且能按步骤
+#      顺序补齐整条链的最近一次机会。已归属的机会不再接收第二笔末步事件。
+#   3. 步骤先后一律按事件实际发生时间 occurred_at 判断，ingested_at 只记录
+#      入库时刻；迟到补录的事件在下一次重新计算时进入新版本。
+#   4. 每次计算生成不可变的 funnel_run 与 funnel_paths。旧版本路径不会被覆盖，
+#      下钻通过路径里的 event_id 回到 events 原始记录，核对事件时刻与归因。
 
-def compute_funnel(funnel: dict[str, Any]) -> list[dict[str, Any]]:
-    """执行漏斗分析：对每一步计算进入、离开和转化率。
+FUNNEL_FAILURE_LABELS = {
+    "MISSING_STEP": "少了一步",
+    "ORDER_MISMATCH": "顺序对不上",
+    "WINDOW_EXCEEDED": "超出转化窗口",
+    "SUPERSEDED": "付款已归属另一次有效浏览",
+}
 
-    从 events 表按步骤序列逐层过滤，计算每步的事件触发人数，
-    流失原因从 event_attrs 提取。
-    """
-    funnel_id = funnel["id"]
-    steps_raw = funnel.get("步骤序列", funnel.get("steps", "[]"))
-    conversion_hours = int(funnel.get("转化窗口小时", funnel.get("conversion_window_hours", 24)))
+_CAMPAIGN_ATTR_KEYS = (
+    "campaign", "campaign_name", "utm_campaign", "activity", "activity_name", "活动", "活动名称",
+)
+_SOURCE_ATTR_KEYS = (
+    "source", "utm_source", "channel", "referrer", "from", "来源", "渠道",
+)
+_SUBJECT_ATTR_KEYS = ("user_id", "用户id", "subject_id", "主体", "uid")
 
+
+def _to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+def _parse_event_time(value: Any) -> datetime | None:
+    """解析事件时间，兼容 ISO(T/空格)、Z、时区偏移和毫秒。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return _to_utc_naive(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
     try:
-        steps = json.loads(steps_raw) if isinstance(steps_raw, str) else steps_raw
+        return _to_utc_naive(datetime.fromisoformat(text))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _fmt_event_time(value: datetime) -> str:
+    return value.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def _event_attrs(evt: dict[str, Any]) -> dict[str, Any]:
+    attrs = evt.get("event_attrs", "{}")
+    if isinstance(attrs, dict):
+        return dict(attrs)
+    try:
+        parsed = json.loads(attrs) if attrs else {}
+        return parsed if isinstance(parsed, dict) else {}
     except (json.JSONDecodeError, TypeError):
-        steps = []
+        return {}
 
-    if not steps:
+
+def _pick_attr(attrs: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = attrs.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return None
+
+
+def _event_subject(evt: dict[str, Any], attrs: dict[str, Any] | None = None) -> str:
+    attrs = attrs if attrs is not None else _event_attrs(evt)
+    for key in _SUBJECT_ATTR_KEYS:
+        value = attrs.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return f"u_{evt['id']}"
+
+
+def _step_label(step_info: Any, idx: int) -> str:
+    if isinstance(step_info, str):
+        return step_info
+    if isinstance(step_info, dict):
+        return str(
+            step_info.get("name") or step_info.get("event")
+            or step_info.get("event_name") or f"step_{idx}"
+        )
+    return f"step_{idx}"
+
+
+def _normalise_steps(steps_raw: Any) -> list[str]:
+    """步骤序列支持 JSON 数组，也容忍逗号/顿号分隔的纯文本。"""
+    if isinstance(steps_raw, str):
+        try:
+            steps = json.loads(steps_raw)
+        except (json.JSONDecodeError, TypeError):
+            text = steps_raw.strip()
+            steps = [part.strip() for part in text.replace("，", ",").replace("、", ",").split(",")]
+    else:
+        steps = steps_raw
+    if not isinstance(steps, list) or not steps:
         return []
+    names = [_step_label(step, idx) for idx, step in enumerate(steps)]
+    return [name for name in names if name and name not in ("step_",)]
 
-    now_dt = datetime.now(timezone.utc)
-    window_start = (now_dt - timedelta(hours=conversion_hours)).strftime("%Y-%m-%dT%H:%M:%S")
 
-    # 清除旧结果
-    db.delete("funnel_results", "funnel_id=?", [funnel_id])
+def _load_named_events(names: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """按事件名取全量记录并解析时间。优先精确匹配，无精确记录时才模糊匹配。"""
+    loaded: dict[str, list[dict[str, Any]]] = {}
+    for name in dict.fromkeys(names):
+        rows = db.fetchall(
+            "SELECT id,event_name,event_attrs,occurred_at,ingested_at FROM events WHERE event_name = ?",
+            [name],
+        )
+        if not rows:
+            rows = db.fetchall(
+                "SELECT id,event_name,event_attrs,occurred_at,ingested_at FROM events "
+                "WHERE event_name LIKE ?",
+                [f"%{name}%"],
+            )
+        for row in rows:
+            row["_time"] = _parse_event_time(row.get("occurred_at"))
+            row["_attrs"] = _event_attrs(row)
+            row["_subject"] = _event_subject(row, row["_attrs"])
+            row["_campaign"] = _pick_attr(row["_attrs"], _CAMPAIGN_ATTR_KEYS)
+            row["_source"] = _pick_attr(row["_attrs"], _SOURCE_ATTR_KEYS)
+        rows = [row for row in rows if row["_time"] is not None]
+        rows.sort(key=lambda row: (row["_time"], int(row["id"])))
+        loaded[name] = rows
+    return loaded
 
-    results: list[dict[str, Any]] = []
-    carried_users: set[str] = set()
 
-    for idx, step_info in enumerate(steps):
-        if isinstance(step_info, str):
-            step_name = step_info
-        elif isinstance(step_info, dict):
-            step_name = step_info.get("name", step_info.get("event", f"step_{idx}"))
-        else:
-            step_name = f"step_{idx}"
+def _event_snapshot(evt: dict[str, Any], step_index: int, step_name: str) -> dict[str, Any]:
+    return {
+        "step_index": step_index,
+        "step_name": step_name,
+        "event_id": int(evt["id"]),
+        "event_name": evt.get("event_name"),
+        "occurred_at": _fmt_event_time(evt["_time"]),
+        "ingested_at": evt.get("ingested_at"),
+        "campaign": evt.get("_campaign"),
+        "source": evt.get("_source"),
+    }
 
-        # 查询该步事件
-        events = db.fetchall(
-            "SELECT * FROM events WHERE event_name LIKE ? AND occurred_at >= ?",
-            [f"%{step_name}%", window_start],
+
+def _chain_between(
+    opportunity: dict[str, Any],
+    terminal: dict[str, Any],
+    per_step: list[list[dict[str, Any]]],
+) -> dict[int, dict[str, Any]] | None:
+    """机会 → 末步事件之间，按步骤序号各取最早可达事件；取不到则链不成立。"""
+    last = len(per_step) - 1
+    chosen: dict[int, dict[str, Any]] = {0: opportunity}
+    previous = opportunity
+    for idx in range(1, last):
+        candidates = [
+            evt for evt in per_step[idx]
+            if (previous["_time"], int(previous["id"]))
+            <= (evt["_time"], int(evt["id"]))
+            <= (terminal["_time"], int(terminal["id"]))
+        ]
+        if not candidates:
+            return None
+        chosen[idx] = candidates[0]
+        previous = candidates[0]
+    chosen[last] = terminal
+    return chosen
+
+
+def _first_missing_step(
+    opportunity: dict[str, Any],
+    terminal: dict[str, Any],
+    per_step: list[list[dict[str, Any]]],
+) -> int | None:
+    previous = opportunity
+    for idx in range(1, len(per_step) - 1):
+        candidates = [
+            evt for evt in per_step[idx]
+            if (previous["_time"], int(previous["id"]))
+            <= (evt["_time"], int(evt["id"]))
+            <= (terminal["_time"], int(terminal["id"]))
+        ]
+        if not candidates:
+            return idx
+        previous = candidates[0]
+    return None
+
+
+def _partial_chain(
+    opportunity: dict[str, Any],
+    per_step: list[list[dict[str, Any]]],
+    window_seconds: int,
+    cutoff: datetime | None = None,
+) -> dict[int, dict[str, Any]]:
+    """未转化机会按时间顺序尽量向下走；末步不参与，且只认截止时刻之前的事件。"""
+    chosen: dict[int, dict[str, Any]] = {0: opportunity}
+    previous = opportunity
+    deadline = opportunity["_time"] + timedelta(seconds=window_seconds)
+    if cutoff is not None and cutoff < deadline:
+        deadline = cutoff
+    for idx in range(1, len(per_step) - 1):
+        candidates = [
+            evt for evt in per_step[idx]
+            if (previous["_time"], int(previous["id"]))
+            <= (evt["_time"], int(evt["id"]))
+            and evt["_time"] <= deadline
+        ]
+        if not candidates:
+            break
+        chosen[idx] = candidates[0]
+        previous = candidates[0]
+    return chosen
+
+
+def _serialise_steps(chain: dict[int, dict[str, Any]], step_names: list[str]) -> str:
+    return json.dumps(
+        {str(idx): _event_snapshot(evt, idx, step_names[idx]) for idx, evt in sorted(chain.items())},
+        ensure_ascii=False,
+    )
+
+
+def _serialise_attribution(chain: dict[int, dict[str, Any]], step_names: list[str]) -> str:
+    rows = [
+        _event_snapshot(evt, idx, step_names[idx])
+        for idx, evt in sorted(chain.items())
+        if evt.get("_campaign") or evt.get("_source")
+    ]
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def _candidate_opportunities(
+    reference_time: datetime,
+    opportunities: list[dict[str, Any]],
+    window_seconds: int,
+) -> list[dict[str, Any]]:
+    """付款时刻之前、仍在转化窗口内的同主体浏览机会，按发生时间升序。"""
+    return [
+        opp for opp in opportunities
+        if opp["_time"] <= reference_time
+        and (reference_time - opp["_time"]).total_seconds() <= window_seconds
+    ]
+
+
+def _failure_for_opportunity(
+    opportunity: dict[str, Any],
+    terminals: list[dict[str, Any]],
+    per_step: list[list[dict[str, Any]]],
+    step_names: list[str],
+    assigned_terminal_ids: set[int],
+    partial: dict[int, dict[str, Any]],
+    window_seconds: int,
+) -> tuple[str, int | None, str, dict[str, Any] | None]:
+    """解释一次机会为什么没有转化，并指出可回查的尝试事件（通常是付款）。"""
+    opp_key = (opportunity["_time"], int(opportunity["id"]))
+    assigned_after = [
+        t for t in terminals
+        if int(t["id"]) in assigned_terminal_ids
+        and (t["_time"], int(t["id"])) > opp_key
+    ]
+    if assigned_after:
+        attempt = min(assigned_after, key=lambda t: (t["_time"], int(t["id"])))
+        return (
+            "SUPERSEDED", None,
+            "付款已归属另一次有效的浏览机会，本次浏览不重复计入转化",
+            attempt,
         )
 
-        step_users: set[str] = set()
-        for evt in events:
-            attrs = {}
-            try:
-                attrs = json.loads(evt.get("event_attrs", "{}")) if isinstance(evt.get("event_attrs"), str) else evt.get("event_attrs", {})
-            except (json.JSONDecodeError, TypeError):
-                pass
-            uid = attrs.get("user_id", f"u_{evt['id']}")
-            step_users.add(uid)
+    after = [t for t in terminals if (t["_time"], int(t["id"])) >= opp_key]
+    before = [t for t in terminals if (t["_time"], int(t["id"])) < opp_key]
 
-        if idx == 0:
-            entry_count = len(step_users)
-            carried_users = step_users
-            exit_count = entry_count
-        else:
-            entry_count = len(carried_users)
-            carried_users = carried_users & step_users
-            exit_count = len(carried_users)
-
-        conversion_rate = round(exit_count / max(entry_count, 1), 4)
-
-        # 流失原因：上一步有但这一步没有的用户
-        dropped = set()
-        if idx > 0:
-            prev_events = db.fetchall(
-                "SELECT * FROM events WHERE event_name LIKE ? AND occurred_at >= ?",
-                [f"%{steps[idx-1] if isinstance(steps[idx-1], str) else steps[idx-1].get('name','')}%", window_start],
+    if not after:
+        if before:
+            attempt = max(before, key=lambda t: (t["_time"], int(t["id"])))
+            return (
+                "ORDER_MISMATCH", None,
+                "顺序对不上：付款发生在这次浏览之前，不能归到后面的浏览",
+                attempt,
             )
-            prev_users = set()
-            for evt in prev_events:
+        reached = max(partial.keys()) if partial else 0
+        missing = reached + 1 if reached + 1 < len(step_names) else len(step_names) - 1
+        return (
+            "MISSING_STEP", missing,
+            f"少了一步：缺少「{step_names[missing]}」",
+            None,
+        )
+
+    in_window = [
+        t for t in after
+        if (t["_time"] - opportunity["_time"]).total_seconds() <= window_seconds
+    ]
+    if not in_window:
+        attempt = min(after, key=lambda t: (t["_time"], int(t["id"])))
+        span = int((attempt["_time"] - opportunity["_time"]).total_seconds())
+        return (
+            "WINDOW_EXCEEDED", None,
+            f"超出转化窗口：付款距浏览约 {span} 秒，超过设定窗口 {window_seconds} 秒",
+            attempt,
+        )
+
+    available = [t for t in in_window if int(t["id"]) not in assigned_terminal_ids] or in_window
+    attempt = min(available, key=lambda t: (t["_time"], int(t["id"])))
+    missing = _first_missing_step(opportunity, attempt, per_step)
+    if missing is None:
+        missing = len(step_names) - 1
+    out_of_order = _out_of_order_step(opportunity, attempt, per_step, missing)
+    if out_of_order is not None:
+        step_idx, step_time = out_of_order
+        return (
+            "ORDER_MISMATCH", step_idx,
+            f"顺序对不上：「{step_names[step_idx]}」发生在 {_fmt_event_time(step_time)}，"
+            f"不在浏览 {_fmt_event_time(opportunity['_time'])} 到付款 {_fmt_event_time(attempt['_time'])} 之间",
+            attempt,
+        )
+    return (
+        "MISSING_STEP", missing,
+        f"少了一步：缺少「{step_names[missing]}」",
+        attempt,
+    )
+
+
+def _out_of_order_step(
+    opportunity: dict[str, Any],
+    terminal: dict[str, Any],
+    per_step: list[list[dict[str, Any]]],
+    missing_index: int,
+) -> tuple[int, datetime] | None:
+    """缺失步骤其实有事件、只是落在浏览之前或付款之后时，判为顺序对不上。"""
+    if not (0 <= missing_index < len(per_step)):
+        return None
+    for evt in per_step[missing_index]:
+        if (opportunity["_time"], int(opportunity["id"])) <= (
+            evt["_time"], int(evt["id"])
+        ) <= (terminal["_time"], int(terminal["id"])):
+            continue
+        return missing_index, evt["_time"]
+    return None
+
+
+def compute_funnel_run(
+    funnel: dict[str, Any],
+    *,
+    as_of: datetime | str | None = None,
+    lookback_hours: float | None = None,
+) -> dict[str, Any]:
+    """执行一次漏斗运算：写入新的 run / 步骤结果 / 路径明细并返回完整结果。"""
+    funnel_id = int(funnel["id"])
+    step_names = _normalise_steps(funnel.get("步骤序列", funnel.get("steps", "[]")))
+    if not step_names:
+        return {
+            "ok": False, "run": None, "results": [], "steps_detail": [], "paths": [],
+            "entry_count": 0, "converted_count": 0, "converted_subjects": 0,
+            "overall_conversion_rate": 0.0, "window_seconds": 0, "step_names": [],
+        }
+
+    window_raw = funnel.get("转化窗口小时", funnel.get("conversion_window_hours", 24))
+    try:
+        window_hours = float(window_raw)
+    except (TypeError, ValueError):
+        window_hours = 24.0
+    if window_hours <= 0:
+        window_hours = 24.0
+    window_seconds = int(round(window_hours * 3600))
+
+    loaded = _load_named_events(step_names)
+    per_step_raw = [loaded[name] for name in step_names]
+
+    data_times = [evt["_time"] for events in per_step_raw for evt in events]
+    explicit_as_of = _parse_event_time(as_of) if as_of is not None else None
+    if explicit_as_of is not None:
+        as_of_dt = explicit_as_of
+    elif data_times:
+        # 未指定 as_of 时以「已观测到的最新事件时刻」为运算基准，历史数据也能稳定重算。
+        as_of_dt = max(data_times)
+    else:
+        as_of_dt = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    if lookback_hours is None:
+        for key in ("分析回看小时", "lookback_hours"):
+            if funnel.get(key) not in (None, ""):
                 try:
-                    a = json.loads(evt.get("event_attrs", "{}")) if isinstance(evt.get("event_attrs"), str) else evt.get("event_attrs", {})
-                    prev_users.add(a.get("user_id", f"u_{evt['id']}"))
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            dropped = prev_users - step_users
+                    lookback_hours = float(funnel[key])
+                    break
+                except (TypeError, ValueError):
+                    lookback_hours = None
+    if lookback_hours is None:
+        lookback_hours = max(24.0, window_hours)
+    if lookback_hours <= 0:
+        lookback_hours = max(24.0, window_hours)
+    horizon_start = as_of_dt - timedelta(hours=lookback_hours)
 
-        drop_reasons = json.dumps({"count": len(dropped), "sample_reasons": list(dropped)[:5]}, ensure_ascii=False)
+    per_step: list[list[dict[str, Any]]] = [
+        [evt for evt in events if horizon_start <= evt["_time"] <= as_of_dt]
+        for events in per_step_raw
+    ]
 
+    run_no_row = db.fetchone(
+        "SELECT COALESCE(MAX(run_no), 0) AS max_no FROM funnel_runs WHERE funnel_id=?",
+        [funnel_id],
+    )
+    run_no = int(run_no_row["max_no"] if run_no_row else 0) + 1
+    parameters = {
+        "as_of": _fmt_event_time(as_of_dt),
+        "lookback_hours": lookback_hours,
+        "window_seconds": window_seconds,
+        "window_hours": window_hours,
+        "step_names": step_names,
+    }
+    run_id = db.insert("funnel_runs", {
+        "funnel_id": funnel_id,
+        "run_no": run_no,
+        "conversion_window_hours": window_hours,
+        "steps_snapshot": json.dumps(step_names, ensure_ascii=False),
+        "status": "计算中",
+        "parameters": json.dumps(parameters, ensure_ascii=False),
+    })
+
+    subjects: dict[str, list[list[dict[str, Any]]]] = defaultdict(lambda: [[] for _ in step_names])
+    for idx, events in enumerate(per_step):
+        for evt in events:
+            subjects[evt["_subject"]][idx].append(evt)
+
+    is_single_step = len(step_names) == 1
+    terminal_index = len(step_names) - 1
+    path_records: list[dict[str, Any]] = []
+
+    for subject_key in sorted(subjects):
+        per_subject = subjects[subject_key]
+        opportunities = per_subject[0]
+        terminals = per_subject[terminal_index] if not is_single_step else []
+
+        assigned_opportunities: set[int] = set()
+        assigned_terminals: set[int] = set()
+        chains: dict[int, dict[int, dict[str, Any]]] = {}
+
+        if is_single_step:
+            for opportunity in opportunities:
+                chains[int(opportunity["id"])] = {0: opportunity}
+        else:
+            # 末步事件按时间顺序归机会：最近、窗口内、能补齐整条链的优先。
+            for terminal in terminals:
+                candidates = [
+                    opp for opp in opportunities
+                    if (opp["_time"], int(opp["id"])) <= (terminal["_time"], int(terminal["id"]))
+                    and (terminal["_time"] - opp["_time"]).total_seconds() <= window_seconds
+                    and int(opp["id"]) not in assigned_opportunities
+                ]
+                chosen = None
+                chain = None
+                for opp in reversed(candidates):
+                    chain = _chain_between(opp, terminal, per_subject)
+                    if chain is not None:
+                        chosen = opp
+                        break
+                if chosen is not None and chain is not None:
+                    assigned_opportunities.add(int(chosen["id"]))
+                    assigned_terminals.add(int(terminal["id"]))
+                    chains[int(chosen["id"])] = chain
+
+        for opportunity in opportunities:
+            opp_id = int(opportunity["id"])
+            chain = chains.get(opp_id)
+            if chain is not None:
+                path_records.append(
+                    _converted_path(
+                        subject_key, opportunity, chain, step_names, window_seconds,
+                        candidates=_candidate_opportunities(
+                            chain[len(step_names) - 1]["_time"], per_subject[0], window_seconds,
+                        ),
+                    )
+                )
+                continue
+
+            provisional = _partial_chain(opportunity, per_subject, window_seconds)
+            failure_code, missing_index, reason, attempt = _failure_for_opportunity(
+                opportunity, terminals, per_subject, step_names,
+                assigned_terminals, provisional, window_seconds,
+            )
+            cutoff = attempt["_time"] if attempt is not None else None
+            partial = _partial_chain(opportunity, per_subject, window_seconds, cutoff)
+            path_records.append(_unconverted_path(
+                subject_key, opportunity, partial, failure_code, reason,
+                missing_index, attempt, step_names, window_seconds,
+                candidates=_candidate_opportunities(
+                    (attempt or opportunity)["_time"], per_subject[0], window_seconds,
+                ),
+            ))
+
+        # 付款之前完全没有浏览：留一条顺序异常记录，便于核对原始付款时刻。
+        if not is_single_step and not opportunities:
+            for terminal in terminals:
+                path_records.append(
+                    _orphan_terminal_path(subject_key, terminal, step_names, window_seconds)
+                )
+
+    for record in path_records:
+        db.insert("funnel_paths", {"run_id": run_id, "funnel_id": funnel_id, **record})
+
+    paths = db.fetchall(
+        "SELECT * FROM funnel_paths WHERE run_id=? ORDER BY id ASC", [run_id]
+    )
+    for path in paths:
+        path["step_events"] = _load_json(path.get("step_events"), {})
+        path["attribution_events"] = _load_json(path.get("attribution_events"), [])
+        path["candidate_opportunities"] = _load_json(path.get("candidate_opportunities"), [])
+
+    entry_subjects = {
+        path["subject_key"] for path in paths if path.get("opportunity_event_id") is not None
+    }
+    converted_subjects = {
+        path["subject_key"] for path in paths
+        if path.get("opportunity_event_id") is not None and path["outcome"] == "已转化"
+    }
+    converted_paths = sum(
+        1 for path in paths
+        if path.get("opportunity_event_id") is not None and path["outcome"] == "已转化"
+    )
+
+    reached_by_subject: dict[str, int] = {}
+    for path in paths:
+        if path.get("opportunity_event_id") is None:
+            continue
+        subject = path["subject_key"]
+        reached_by_subject[subject] = max(
+            reached_by_subject.get(subject, -1), int(path["reached_step"])
+        )
+
+    results: list[dict[str, Any]] = []
+    previous_set = entry_subjects
+    for idx, step_name in enumerate(step_names):
+        reaching = {
+            subject for subject, reached in reached_by_subject.items() if reached >= idx
+        }
+        entry_count = len(previous_set)
+        exit_count = len(reaching)
+        dropped = previous_set - reaching
+        breakdown = _drop_breakdown(paths, dropped)
+        conversion_rate = round(exit_count / max(entry_count, 1), 6)
+        drop_payload = {
+            "count": len(dropped),
+            "breakdown": breakdown,
+            "sample_subjects": sorted(dropped)[:5],
+        }
         result_id = db.insert("funnel_results", {
             "funnel_id": funnel_id,
+            "run_id": run_id,
             "step_index": idx,
             "step_name": step_name,
             "entry_count": entry_count,
             "exit_count": exit_count,
             "conversion_rate": conversion_rate,
-            "drop_reasons": drop_reasons,
+            "drop_reasons": json.dumps(drop_payload, ensure_ascii=False),
         })
         results.append({
             "id": result_id,
+            "run_id": run_id,
             "step_index": idx,
             "step_name": step_name,
             "entry_count": entry_count,
             "exit_count": exit_count,
             "conversion_rate": conversion_rate,
+            "drop_reasons": drop_payload,
         })
+        previous_set = reaching
 
-    return results
+    # 总体转化率按「转化人数 / 入口人数」计算，而不是末步相对上一步的步内转化率。
+    overall_rate = round(len(converted_subjects) / max(len(entry_subjects), 1), 6)
+    db.update("funnel_runs", {
+        "status": "已完成",
+        "entry_count": len(entry_subjects),
+        "converted_count": len(converted_subjects),
+        "converted_subjects": len(converted_subjects),
+    }, "id=?", [run_id])
+
+    run_row = db.fetchone("SELECT * FROM funnel_runs WHERE id=?", [run_id]) or {}
+    run_row["parameters"] = _load_json(run_row.get("parameters"), parameters)
+    return {
+        "ok": True,
+        "run": run_row,
+        "run_id": run_id,
+        "run_no": run_no,
+        "steps_detail": results,
+        "results": results,
+        "paths": paths,
+        "entry_count": len(entry_subjects),
+        # converted_count 按转化人数统计；converted_paths 才是付款机会条数。
+        "converted_count": len(converted_subjects),
+        "converted_paths": converted_paths,
+        "converted_subjects": len(converted_subjects),
+        "overall_conversion_rate": overall_rate,
+        "window_seconds": window_seconds,
+        "step_names": step_names,
+        "parameters": parameters,
+    }
+
+
+def _load_json(value: Any, default: Any) -> Any:
+    if value is None or value == "":
+        return default
+    if isinstance(value, (dict, list)):
+        return value
+    try:
+        return json.loads(value)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+
+def _candidate_snapshots(
+    opportunity: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    step_names: list[str],
+) -> str:
+    """同一主体在本次付款之前、窗口内的全部浏览机会，各带自己的活动/来源。"""
+    rows = []
+    for cand in candidates:
+        rows.append({
+            "event_id": int(cand["id"]),
+            "occurred_at": _fmt_event_time(cand["_time"]),
+            "campaign": cand.get("_campaign"),
+            "source": cand.get("_source"),
+            "selected": int(cand["id"]) == int(opportunity["id"]),
+        })
+    return json.dumps(rows, ensure_ascii=False)
+
+
+def _converted_path(
+    subject_key: str,
+    opportunity: dict[str, Any],
+    chain: dict[int, dict[str, Any]],
+    step_names: list[str],
+    window_seconds: int,
+    candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    terminal = chain[len(step_names) - 1]
+    return {
+        "subject_key": subject_key,
+        "outcome": "已转化",
+        "reached_step": len(step_names) - 1,
+        "step_count": len(step_names),
+        "opportunity_event_id": int(opportunity["id"]),
+        "opportunity_at": _fmt_event_time(opportunity["_time"]),
+        "attempt_event_id": None,
+        "attempt_at": None,
+        "conversion_event_id": int(terminal["id"]),
+        "conversion_at": _fmt_event_time(terminal["_time"]),
+        "window_seconds": window_seconds,
+        "failure_code": None,
+        "failure_reason": None,
+        "missing_step_index": None,
+        "missing_step_name": None,
+        "opportunity_campaign": opportunity.get("_campaign"),
+        "opportunity_source": opportunity.get("_source"),
+        "candidate_opportunities": _candidate_snapshots(opportunity, candidates or [opportunity], step_names),
+        "attribution_campaign": opportunity.get("_campaign"),
+        "attribution_source": opportunity.get("_source"),
+        "attribution_events": _serialise_attribution(chain, step_names),
+        "step_events": _serialise_steps(chain, step_names),
+    }
+
+
+def _unconverted_path(
+    subject_key: str,
+    opportunity: dict[str, Any],
+    partial: dict[int, dict[str, Any]],
+    failure_code: str,
+    failure_reason: str,
+    missing_index: int | None,
+    attempt: dict[str, Any] | None,
+    step_names: list[str],
+    window_seconds: int,
+    candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    reached_step = max(partial.keys()) if partial else 0
+    return {
+        "subject_key": subject_key,
+        "outcome": "未转化",
+        "reached_step": reached_step,
+        "step_count": len(step_names),
+        "opportunity_event_id": int(opportunity["id"]),
+        "opportunity_at": _fmt_event_time(opportunity["_time"]),
+        "attempt_event_id": int(attempt["id"]) if attempt else None,
+        "attempt_at": _fmt_event_time(attempt["_time"]) if attempt else None,
+        "conversion_event_id": None,
+        "conversion_at": None,
+        "window_seconds": window_seconds,
+        "failure_code": failure_code,
+        "failure_reason": failure_reason,
+        "missing_step_index": missing_index,
+        "missing_step_name": (
+            step_names[missing_index]
+            if missing_index is not None and 0 <= missing_index < len(step_names)
+            else None
+        ),
+        "opportunity_campaign": opportunity.get("_campaign"),
+        "opportunity_source": opportunity.get("_source"),
+        "candidate_opportunities": _candidate_snapshots(opportunity, candidates or [opportunity], step_names),
+        "attribution_campaign": opportunity.get("_campaign"),
+        "attribution_source": opportunity.get("_source"),
+        "attribution_events": _serialise_attribution(partial, step_names),
+        "step_events": _serialise_steps(partial, step_names),
+    }
+
+
+def _orphan_terminal_path(
+    subject_key: str,
+    terminal: dict[str, Any],
+    step_names: list[str],
+    window_seconds: int,
+) -> dict[str, Any]:
+    return {
+        "subject_key": subject_key,
+        "outcome": "未转化",
+        "reached_step": -1,
+        "step_count": len(step_names),
+        "opportunity_event_id": None,
+        "opportunity_at": None,
+        "attempt_event_id": int(terminal["id"]),
+        "attempt_at": _fmt_event_time(terminal["_time"]),
+        "conversion_event_id": None,
+        "conversion_at": None,
+        "window_seconds": window_seconds,
+        "failure_code": "ORDER_MISMATCH",
+        "failure_reason": "顺序对不上：付款发生在任何有效浏览之前，不能进入已完成转化",
+        "missing_step_index": 0,
+        "missing_step_name": step_names[0],
+        "opportunity_campaign": terminal.get("_campaign"),
+        "opportunity_source": terminal.get("_source"),
+        "candidate_opportunities": "[]",
+        "attribution_campaign": terminal.get("_campaign"),
+        "attribution_source": terminal.get("_source"),
+        "attribution_events": _serialise_attribution({0: terminal}, step_names),
+        "step_events": _serialise_steps({0: terminal}, step_names),
+    }
+
+
+def _drop_breakdown(paths: list[dict[str, Any]], dropped_subjects: set[str]) -> dict[str, int]:
+    """按主体解释流失原因：每人只取最新一次机会的结论，避免同人多条路径重复计数。"""
+    primary: dict[str, dict[str, Any]] = {}
+    for path in paths:
+        subject = path["subject_key"]
+        if subject not in dropped_subjects:
+            continue
+        key = (str(path.get("opportunity_at") or ""), int(path.get("id") or 0))
+        current = primary.get(subject)
+        if current is None:
+            primary[subject] = path
+            continue
+        current_key = (str(current.get("opportunity_at") or ""), int(current.get("id") or 0))
+        if key >= current_key:
+            primary[subject] = path
+    breakdown: Counter[str] = Counter()
+    for path in primary.values():
+        code = path.get("failure_code") or "MISSING_STEP"
+        breakdown[FUNNEL_FAILURE_LABELS.get(code, code)] += 1
+    return dict(breakdown)
+
+
+def compute_funnel(funnel: dict[str, Any]) -> list[dict[str, Any]]:
+    """兼容旧调用：执行一次漏斗运算并返回最新版本的步骤明细。"""
+    return compute_funnel_run(funnel)["results"]
 
 
 # ============================================================================
